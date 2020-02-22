@@ -9,28 +9,27 @@ const (
 	Path = "identifiers.txt"
 
 	// MaxDiff is the max timestamp difference.
-	MaxDiff = 2 // Seconds
+	MaxDiff = 2 * time.Second
 
 	// DefaultPlayerID is the default Kodi player id.
 	DefaultPlayerID = 1
 
 	// CheckInterval is a duration that defines how often
 	// to check for desyncs.
-	CheckInterval = time.Second * 2
+	CheckInterval = 2 * time.Second
 )
 
 func main() {
-	clients := InitializeClients(Path)
-	ticker := time.NewTicker(time.Second)
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				LogInfo("Fetching timestamps")
-				SortClients(clients)
-			}
-		}
-	}()
+	pool := NewPoolFromFile(Path)
+	if len(pool.Clients) < 1 {
+		LogFatal("No available clients")
+	}
+
+	// Register global pause handler
+	go pool.PauseHandler()
+
+	// Register client sync handler
+	go pool.SyncHandler()
 
 	select {}
 }

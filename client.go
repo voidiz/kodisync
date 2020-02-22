@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,57 +28,48 @@ type Client struct {
 	// OperationDone is a channel used to notify listeners of completed operations.
 	// The integer contains the SendRecv ID associated with the operation.
 	OperationDone chan int
+
+	// Notification channel shared by all clients, used to notify
+	// other clients of incoming notifications such as one client being paused.
+	Notification chan string
+
+	// State channel shared by all clients, used to inform
+	// clients about pool state changes
+	StateInformer chan int
 }
 
 // ByTimestamp implements sort.Interface for []Client
 // based on the Timestamp field.
-type ByTimestamp []Client
+type ByTimestamp []*Client
 
 func (bt ByTimestamp) Len() int           { return len(bt) }
 func (bt ByTimestamp) Swap(i, j int)      { bt[i], bt[j] = bt[j], bt[i] }
 func (bt ByTimestamp) Less(i, j int) bool { return bt[i].Timestamp < bt[j].Timestamp }
 
-// InitializeClients creates and connects clients from client
-// identifiers written in a text file located at path.
-// Format: hostname:port,username,password
-func InitializeClients(path string) []Client {
-	file, err := os.Open(path)
+// NewClient creates a connected client from credentials and a notification
+// and state channel shared by all clients.
+func NewClient(host, user, pass string, notifChan chan string,
+	stateInformer chan int) (*Client, error) {
+	newClient := Client{
+		Host:             host,
+		User:             user,
+		Password:         pass,
+		SendChannel:      make(chan BaseSend),
+		ActiveOperations: map[int]int{},
+		OperationDone:    make(chan int),
+		Notification:     notifChan,
+		StateInformer:    stateInformer,
+	}
+
+	err := newClient.Connect()
 	if err != nil {
-		LogFatal(err)
-	}
-
-	// Read line by line
-	var clients []Client
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		// Skip if hashtag
-		if scanner.Text()[0] == byte('#') {
-			continue
-		}
-
-		identifier := strings.Split(scanner.Text(), ",")
-		if err != nil {
-			LogFatal(err)
-		}
-
-		newClient := Client{
-			Host:             identifier[0],
-			User:             identifier[1],
-			Password:         identifier[2],
-			SendChannel:      make(chan BaseSend),
-			ActiveOperations: map[int]int{},
-			OperationDone:    make(chan int),
-		}
-
-		if err := newClient.Connect(); err != nil {
-			LogWarn(err)
-		}
+		LogWarnf("Failed connecting to %s\n\tReason: %s\n",
+			newClient.Description(), err)
+	} else {
 		LogInfof("Connected to %s\n", newClient.Description())
-
-		clients = append(clients, newClient)
 	}
 
-	return clients
+	return &newClient, err
 }
 
 // Connect establishes a websocket connection and sets it in the
@@ -109,11 +97,11 @@ func (c *Client) Connect() error {
 // and runs until the corresponding response is received.
 func (c *Client) RequestWorker(payload BaseSend, wg *sync.WaitGroup) {
 	c.SendChannel <- payload
+
 	for {
 		select {
 		case opID := <-c.OperationDone:
 			if opID == payload.ID {
-				LogInfof("Worker %d finished\n", payload.ID)
 				wg.Done()
 				return
 			}
@@ -123,8 +111,13 @@ func (c *Client) RequestWorker(payload BaseSend, wg *sync.WaitGroup) {
 }
 
 // Description prints the string representation of a Client.
-func (c Client) Description() string {
+func (c *Client) Description() string {
 	return fmt.Sprintf("%s (%s)", c.Host, c.User)
+}
+
+// TimeDifference returns the difference c.Timestamp - other.Timestamp.
+func (c *Client) TimeDifference(other *Client) time.Duration {
+	return c.Timestamp - other.Timestamp
 }
 
 // sendHandler is responsible for dispatching messages.
@@ -135,6 +128,9 @@ func (c *Client) sendHandler() {
 			if err := c.Connection.WriteJSON(payload); err != nil {
 				LogWarn(err)
 			}
+
+			// Add request to active operations
+			c.ActiveOperations[payload.ID] = payload.Operation
 		}
 	}
 }
@@ -143,6 +139,15 @@ func (c *Client) sendHandler() {
 func (c *Client) readHandler() {
 	for {
 		var result BaseRecv
+		// var debug *json.RawMessage
+		// if err := c.Connection.ReadJSON(&debug); err != nil {
+		// 	LogWarn(err)
+		// }
+		// b, _ := debug.MarshalJSON()
+		// if err := json.Unmarshal(b, &result); err != nil {
+		// 	LogWarn(err)
+		// }
+		// LogInfo("debug", string(b))
 		if err := c.Connection.ReadJSON(&result); err != nil {
 			LogWarn(err)
 		}
@@ -151,17 +156,23 @@ func (c *Client) readHandler() {
 			LogWarn(result.ToString())
 		}
 
-		// Notification
-		c.handleNotification(result)
-
-		// Response (to request made in SendHandler)
-		c.handleResponse(result)
+		if result.ID == 0 { // Notification always has ID 0
+			c.handleNotification(result)
+		} else { // Not 0 implies a unique ID that we generated, expecting a response
+			c.handleResponse(result)
+		}
 	}
 }
 
 // handleNotification is responsible for handling notifications sent
 // from clients.
 func (c *Client) handleNotification(notif BaseRecv) {
+	// Non-blocking notification send to pool-wide channel
+	select {
+	case c.Notification <- notif.Method:
+	default:
+	}
+
 	switch notif.Method {
 	case "Player.OnResume":
 		LogInfof("Resumed %s\n", c.Description())
@@ -188,24 +199,28 @@ func (c *Client) handleResponse(response BaseRecv) {
 		}
 
 		c.Timestamp = pt.ToDuration()
-		LogInfo(c.Timestamp)
 	}
 
 	// Delete the operation since we got a response
 	delete(c.ActiveOperations, response.ID)
 
-	// Notify through channel
-	c.OperationDone <- response.ID
+	// Notify through channel (non-blocking)
+	// Default is necessary in cases where we don't care
+	// about the response and ignore reading from c.OperationDone
+	select {
+	case c.OperationDone <- response.ID:
+	default:
+	}
 }
 
 // wsURI returns the websocket URI for a Client.
-func (c Client) wsURI() url.URL {
+func (c *Client) wsURI() url.URL {
 	return url.URL{Scheme: "ws", Host: c.Host, Path: "/jsonrpc"}
 }
 
 // addAuthHeader adds the Authorization header using the client
 // credentials to a http header.
-func (c Client) addAuthHeader(h *http.Header) {
+func (c *Client) addAuthHeader(h *http.Header) {
 	bCreds := []byte(fmt.Sprintf("%s:%s", c.User, c.Password))
 	sEnc := base64.StdEncoding.EncodeToString(bCreds)
 	h.Add("Authorization", fmt.Sprintf("Basic %s", sEnc))
