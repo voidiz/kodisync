@@ -41,4 +41,5 @@ func LogFatal(v ...interface{}) {
 // LogFatalf logs fatal messages with a format string.
 func LogFatalf(format string, v ...interface{}) {
 	fatalLogger.Output(2, fmt.Sprintf(format, v...))
+	os.Exit(1)
 }

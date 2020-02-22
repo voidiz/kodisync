@@ -49,16 +49,15 @@ func NewPoolFromFile(path string) *Pool {
 		}
 
 		identifier := strings.Split(scanner.Text(), ",")
-		if err != nil {
-			LogFatal(err)
-		}
-
 		newClient, err := NewClient(identifier[0], identifier[1], identifier[2],
 			notifChan, stateChan)
-
-		if err == nil {
-			clients = append(clients, newClient)
+		if err != nil {
+			LogFatalf("Failed connecting to %s\n\tReason: %s\n",
+				newClient.Description(), err)
 		}
+
+		clients = append(clients, newClient)
+		LogInfof("Connected to %s\n", newClient.Description())
 	}
 
 	return &Pool{

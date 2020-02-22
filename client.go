@@ -61,15 +61,7 @@ func NewClient(host, user, pass string, notifChan chan string,
 		StateInformer:    stateInformer,
 	}
 
-	err := newClient.Connect()
-	if err != nil {
-		LogWarnf("Failed connecting to %s\n\tReason: %s\n",
-			newClient.Description(), err)
-	} else {
-		LogInfof("Connected to %s\n", newClient.Description())
-	}
-
-	return &newClient, err
+	return &newClient, newClient.Connect()
 }
 
 // Connect establishes a websocket connection and sets it in the
