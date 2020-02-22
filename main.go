@@ -25,6 +25,16 @@ func main() {
 		LogFatal("No available clients")
 	}
 
+	// Play all clients
+	for _, c := range pool.Clients {
+		go c.Play(true)
+	}
+
+	// Wait one second before continuing since we cannot
+	// reliably determinewhat state the client is in
+	// without checking every one of them
+	time.Sleep(time.Second)
+
 	// Register global pause handler
 	go pool.PauseHandler()
 

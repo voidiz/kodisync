@@ -4,12 +4,20 @@ import (
 	"bufio"
 	"os"
 	"strings"
+	"sync"
 )
 
-// Client state enum
+// Client state enum (starts at 1)
 const (
+	// All clients playing
 	Playing = iota + 1
+
+	// All clients paused
 	Paused
+
+	// Used to ignore notifications during certain operations
+	// such as pausing all clients
+	Busy
 )
 
 // Pool is a collection of all connected clients.
@@ -21,7 +29,9 @@ type Pool struct {
 	Notification chan string
 
 	// Global state of clients (Playing, paused..)
-	State int
+	// Controlled and checked using methods State and ChangeState
+	state int
+	mux   sync.Mutex
 
 	// Channel to inform clients of pool State
 	StateInformer chan int
@@ -36,9 +46,12 @@ func NewPoolFromFile(path string) *Pool {
 		LogFatal(err)
 	}
 
-	var clients []*Client
-	notifChan := make(chan string)
-	stateChan := make(chan int)
+	pool := &Pool{
+		Clients:       []*Client{},
+		Notification:  make(chan string),
+		StateInformer: make(chan int),
+		state:         Playing,
+	}
 
 	// Read line by line
 	scanner := bufio.NewScanner(file)
@@ -49,21 +62,23 @@ func NewPoolFromFile(path string) *Pool {
 		}
 
 		identifier := strings.Split(scanner.Text(), ",")
-		newClient, err := NewClient(identifier[0], identifier[1], identifier[2],
-			notifChan, stateChan)
-		if err != nil {
-			LogFatalf("Failed connecting to %s\n\tReason: %s\n",
-				newClient.Description(), err)
-		}
-
-		clients = append(clients, newClient)
-		LogInfof("Connected to %s\n", newClient.Description())
+		pool.NewClient(identifier[0], identifier[1], identifier[2])
 	}
 
-	return &Pool{
-		Clients:       clients,
-		Notification:  notifChan,
-		State:         Playing,
-		StateInformer: stateChan,
-	}
+	return pool
+}
+
+// ChangeState is used to change the state from multiple goroutines
+// without encountering conflicts.
+func (p *Pool) ChangeState(state int) {
+	p.mux.Lock()
+	p.state = state
+	p.mux.Unlock()
+}
+
+// State returns the global client state.
+func (p *Pool) State() int {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+	return p.state
 }

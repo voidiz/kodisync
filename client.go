@@ -29,13 +29,13 @@ type Client struct {
 	// The integer contains the SendRecv ID associated with the operation.
 	OperationDone chan int
 
-	// Notification channel shared by all clients, used to notify
-	// other clients of incoming notifications such as one client being paused.
-	Notification chan string
+	// Pool contains all clients and information shared by all
+	// clients such as a global notification channel and the global state.
+	Pool *Pool
 
-	// State channel shared by all clients, used to inform
-	// clients about pool state changes
-	StateInformer chan int
+	// Notification is a channel specific to the client used
+	// to transport the notification method.
+	Notification chan string
 }
 
 // ByTimestamp implements sort.Interface for []Client
@@ -46,10 +46,9 @@ func (bt ByTimestamp) Len() int           { return len(bt) }
 func (bt ByTimestamp) Swap(i, j int)      { bt[i], bt[j] = bt[j], bt[i] }
 func (bt ByTimestamp) Less(i, j int) bool { return bt[i].Timestamp < bt[j].Timestamp }
 
-// NewClient creates a connected client from credentials and a notification
-// and state channel shared by all clients.
-func NewClient(host, user, pass string, notifChan chan string,
-	stateInformer chan int) (*Client, error) {
+// NewClient creates a connected client from credentials and adds
+// it to the pool.
+func (p *Pool) NewClient(host, user, pass string) {
 	newClient := Client{
 		Host:             host,
 		User:             user,
@@ -57,11 +56,17 @@ func NewClient(host, user, pass string, notifChan chan string,
 		SendChannel:      make(chan BaseSend),
 		ActiveOperations: map[int]int{},
 		OperationDone:    make(chan int),
-		Notification:     notifChan,
-		StateInformer:    stateInformer,
+		Pool:             p,
+		Notification:     make(chan string),
 	}
 
-	return &newClient, newClient.Connect()
+	if err := newClient.Connect(); err != nil {
+		LogFatalf("Failed connecting to %s\n\tReason: %s\n",
+			newClient.Description(), err)
+	}
+
+	p.Clients = append(p.Clients, &newClient)
+	LogInfof("Connected to %s\n", newClient.Description())
 }
 
 // Connect establishes a websocket connection and sets it in the
@@ -91,14 +96,11 @@ func (c *Client) RequestWorker(payload BaseSend, wg *sync.WaitGroup) {
 	c.SendChannel <- payload
 
 	for {
-		select {
-		case opID := <-c.OperationDone:
-			if opID == payload.ID {
-				wg.Done()
-				return
-			}
+		opID := <-c.OperationDone
+		if opID == payload.ID {
+			wg.Done()
+			return
 		}
-
 	}
 }
 
@@ -115,15 +117,13 @@ func (c *Client) TimeDifference(other *Client) time.Duration {
 // sendHandler is responsible for dispatching messages.
 func (c *Client) sendHandler() {
 	for {
-		select {
-		case payload := <-c.SendChannel:
-			if err := c.Connection.WriteJSON(payload); err != nil {
-				LogWarn(err)
-			}
-
-			// Add request to active operations
-			c.ActiveOperations[payload.ID] = payload.Operation
+		payload := <-c.SendChannel
+		if err := c.Connection.WriteJSON(payload); err != nil {
+			LogWarn(err)
 		}
+
+		// Add request to active operations
+		c.ActiveOperations[payload.ID] = payload.Operation
 	}
 }
 
@@ -160,6 +160,12 @@ func (c *Client) readHandler() {
 // from clients.
 func (c *Client) handleNotification(notif BaseRecv) {
 	// Non-blocking notification send to pool-wide channel
+	select {
+	case c.Pool.Notification <- notif.Method:
+	default:
+	}
+
+	// Non-blocking notification send to client specific channel
 	select {
 	case c.Notification <- notif.Method:
 	default:
