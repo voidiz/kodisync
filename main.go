@@ -31,7 +31,7 @@ func main() {
 	}
 
 	// Wait one second before continuing since we cannot
-	// reliably determinewhat state the client is in
+	// reliably determine what state the client is in
 	// without checking every one of them
 	time.Sleep(time.Second)
 

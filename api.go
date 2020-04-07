@@ -11,6 +11,7 @@ import (
 // (starting at 1 to avoid zero value for int, 0)
 const (
 	PlayerGetPropertiesTime = iota + 1
+	PlayerGetPropertiesSpeed
 )
 
 // BaseRecv is the base message received from Kodi.
@@ -46,7 +47,8 @@ type PlayerTime struct {
 // PlayerProperties contains properties returned by
 // Player.GetProperties in the "result" key.
 type PlayerProperties struct {
-	Time *json.RawMessage `json:"time"`
+	Time  *json.RawMessage `json:"time"`
+	Speed *json.RawMessage `json:"speed"`
 
 	// TODO: Add more property fields as needed
 }

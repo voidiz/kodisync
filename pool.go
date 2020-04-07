@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"os"
 	"strings"
-	"sync"
 )
 
 // Client state enum (starts at 1)
@@ -14,10 +13,6 @@ const (
 
 	// All clients paused
 	Paused
-
-	// Used to ignore notifications during certain operations
-	// such as pausing all clients
-	Busy
 )
 
 // Pool is a collection of all connected clients.
@@ -28,10 +23,8 @@ type Pool struct {
 	// other clients of incoming notifications such as one client being paused.
 	Notification chan string
 
-	// Global state of clients (Playing, paused..)
-	// Controlled and checked using methods State and ChangeState
-	state int
-	mux   sync.Mutex
+	// Used to keep track of the global state of the clients
+	State int
 
 	// Channel to inform clients of pool State
 	StateInformer chan int
@@ -49,8 +42,8 @@ func NewPoolFromFile(path string) *Pool {
 	pool := &Pool{
 		Clients:       []*Client{},
 		Notification:  make(chan string),
+		State:         Playing,
 		StateInformer: make(chan int),
-		state:         Playing,
 	}
 
 	// Read line by line
@@ -66,19 +59,4 @@ func NewPoolFromFile(path string) *Pool {
 	}
 
 	return pool
-}
-
-// ChangeState is used to change the state from multiple goroutines
-// without encountering conflicts.
-func (p *Pool) ChangeState(state int) {
-	p.mux.Lock()
-	p.state = state
-	p.mux.Unlock()
-}
-
-// State returns the global client state.
-func (p *Pool) State() int {
-	p.mux.Lock()
-	defer p.mux.Unlock()
-	return p.state
 }

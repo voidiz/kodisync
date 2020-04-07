@@ -18,6 +18,7 @@ type Client struct {
 	User        string          // Username
 	Password    string          // Password
 	Timestamp   time.Duration   // Video timestamp
+	State       int             // Playing state, paused = 0, playing = 1
 	Connection  *websocket.Conn // WS connection
 	SendChannel chan BaseSend   // Channel used to send messages over WS
 
@@ -36,6 +37,11 @@ type Client struct {
 	// Notification is a channel specific to the client used
 	// to transport the notification method.
 	Notification chan string
+
+	// IgnoreCount is used to prevent sending notifications triggered
+	// by the program (e.g. when pausing/playing to sync clients) to
+	// all clients (the pool).
+	IgnoreCount int
 }
 
 // ByTimestamp implements sort.Interface for []Client
@@ -54,10 +60,12 @@ func (p *Pool) NewClient(host, user, pass string) {
 		User:             user,
 		Password:         pass,
 		SendChannel:      make(chan BaseSend),
+		State:            1,
 		ActiveOperations: map[int]int{},
 		OperationDone:    make(chan int),
 		Pool:             p,
 		Notification:     make(chan string),
+		IgnoreCount:      0,
 	}
 
 	if err := newClient.Connect(); err != nil {
@@ -159,12 +167,6 @@ func (c *Client) readHandler() {
 // handleNotification is responsible for handling notifications sent
 // from clients.
 func (c *Client) handleNotification(notif BaseRecv) {
-	// Non-blocking notification send to pool-wide channel
-	select {
-	case c.Pool.Notification <- notif.Method:
-	default:
-	}
-
 	// Non-blocking notification send to client specific channel
 	select {
 	case c.Notification <- notif.Method:
@@ -173,10 +175,25 @@ func (c *Client) handleNotification(notif BaseRecv) {
 
 	switch notif.Method {
 	case "Player.OnResume":
+		c.State = 1
 		LogInfof("Resumed %s\n", c.Description())
 	case "Player.OnPause":
+		c.State = 0
 		LogInfof("Paused %s\n", c.Description())
 	}
+
+	// Don't send pool-wide notification if counter is over 0
+	if c.IgnoreCount > 0 {
+		c.IgnoreCount--
+		return
+	}
+
+	// Non-blocking notification send to pool-wide channel
+	select {
+	case c.Pool.Notification <- notif.Method:
+	default:
+	}
+
 }
 
 // handleResponse is responsible for handling responses
@@ -197,6 +214,18 @@ func (c *Client) handleResponse(response BaseRecv) {
 		}
 
 		c.Timestamp = pt.ToDuration()
+	case PlayerGetPropertiesSpeed: // Set client state (paused = 0, playing = 1)
+		var pp PlayerProperties
+		if err := json.Unmarshal(*response.Result, &pp); err != nil {
+			LogWarn(err)
+		}
+
+		var speed int
+		if err := json.Unmarshal(*pp.Speed, &speed); err != nil {
+			LogWarn(err)
+		}
+
+		c.State = speed
 	}
 
 	// Delete the operation since we got a response

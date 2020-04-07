@@ -10,13 +10,11 @@ import (
 // client timestamps.
 func (p *Pool) SyncHandler() {
 	for {
-		// Only sync when playing
-		if p.State() != Playing {
-			state := <-p.StateInformer
-			if state != Playing {
-				LogInfo(state)
-				continue // Check again
-			}
+		// Only sync when the global state is Playing
+		if p.State != Playing {
+			// Wait until a new state is set
+			<-p.StateInformer
+			continue
 		}
 
 		p.sortClients()
@@ -31,37 +29,41 @@ func (p *Pool) PauseHandler() {
 	for {
 		notif := <-p.Notification
 
-		// Don't pause/resume when in the middle
-		// of an operation affecting all clients
-		if p.State() == Busy {
-			continue
-		}
-
 		var play bool
 		switch notif {
 		case "Player.OnPause":
-			LogInfo("Trigger global pause with state", p.State())
+			LogInfo("Global pause triggered")
 			play = false
-			p.ChangeState(Paused)
+			p.State = Paused
 		case "Player.OnResume":
-			LogInfo("Trigger global resume with state", p.State())
+			LogInfo("Global play triggered")
 			play = true
-			p.ChangeState(Playing)
+			p.State = Playing
 		default:
-			continue
+			LogInfo("Unknown notification", notif)
 		}
 
 		var wg sync.WaitGroup
 		for _, c := range p.Clients {
+			c.ignoreStateNotification(play)
 			wg.Add(1)
-			go c.PlayAwait(play, &wg)
+			go c.RequestWorker(c.playPayload(play), &wg)
 		}
 
 		// Wait until all clients are done and
-		// inform every listener of a pause/resume
+		// inform every listener (if any) of a pause/resume
 		wg.Wait()
-		p.StateInformer <- p.State()
+		select {
+		case p.StateInformer <- p.State:
+		default:
+		}
 	}
+}
+
+// Play plays and pauses a client depending on
+// boolean play.
+func (c *Client) Play(play bool) {
+	c.SendChannel <- c.playPayload(play)
 }
 
 // sortClients fetches all timestamps from each client,
@@ -89,31 +91,35 @@ func (p *Pool) sortClients() {
 	sort.Sort(ByTimestamp(p.Clients))
 }
 
-// PlayBlock plays/pauses and waits until the client has
-// started playing/paused.
-func (c *Client) PlayBlock(play bool) {
-	// Check for state notification not reliable
-	// since if the player is already in the same
-	// state it won't change.
-	// for {
-	// 	method := <-c.Notification
-	// 	if (play && method == "Player.OnResume") ||
-	// 		(!play && method == "Player.OnPause") {
-	// 		return
-	// 	}
-	// }
+// ignoreStateNotification is used to ignore a play/pause notification based on the
+// current state of the client. The purpose of this is to avoid
+// ignoring too many notifications since the client only sends an notification
+// if the action was successful, e.g. if the client is playing and a
+// pause request was sent.
+// Play = true means ignore a play notification and false means ignore a pause
+// notification.
+func (c *Client) ignoreStateNotification(play bool) {
+	params := map[string]interface{}{
+		"playerid":   DefaultPlayerID,
+		"properties": []string{"speed"},
+	}
+
+	payload := NewBaseSend("Player.GetProperties", params, PlayerGetPropertiesSpeed)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go c.RequestWorker(c.playPayload(play), &wg)
+	go c.RequestWorker(payload, &wg)
 	wg.Wait()
-}
 
-// PlayAwait plays/pauses and waits until the client has
-// started playing/paused and executes wg.Done().
-func (c *Client) PlayAwait(play bool, wg *sync.WaitGroup) {
-	c.PlayBlock(play)
-	wg.Done()
+	// Paused and ignoring play
+	if c.State == 0 && play {
+		c.IgnoreCount++
+	}
+
+	// Playing and ignoring pause
+	if c.State == 1 && !play {
+		c.IgnoreCount++
+	}
 }
 
 // playPayload creates a payload used for playing/pausing
@@ -127,12 +133,6 @@ func (c *Client) playPayload(play bool) BaseSend {
 	return NewBaseSend("Player.PlayPause", params, 0)
 }
 
-// Play plays and pauses a client depending on
-// boolean play.
-func (c *Client) Play(play bool) {
-	c.SendChannel <- c.playPayload(play)
-}
-
 // syncClients pauses the clients in a Pool (most behind to most ahead)
 // in a way that they all sync up. Returns when all clients are synced up.
 func (p *Pool) syncClients() {
@@ -142,17 +142,16 @@ func (p *Pool) syncClients() {
 		return
 	}
 
-	// Set state to busy to avoid picking up notifications
-	// caused by this method
-	p.ChangeState(Busy)
-
 	// Used to determine when all clients (except the one most behind)
 	// have been sent a pause signal
 	var wgDone sync.WaitGroup
 
-	// Used to determine when all clients have been unpaused again
-	var wgPaused sync.WaitGroup
+	// Play client behind (in case it is paused)
+	// (This will trigger a global play in PauseHandler which is fine since we're
+	// pausing them anyway)
+	p.Clients[0].Play(true)
 
+	// Pause all clients ahead
 	for i := 1; i < len(p.Clients); i++ {
 		ahead := p.Clients[i]
 		timeDiff := ahead.TimeDifference(p.Clients[0])
@@ -160,75 +159,39 @@ func (p *Pool) syncClients() {
 			p.Clients[0].Description(), ahead.Description())
 
 		wgDone.Add(1)
-		wgPaused.Add(1)
-		go ahead.pauseClient(timeDiff, &wgDone, &wgPaused)
+		go ahead.pauseClient(timeDiff, &wgDone)
 	}
 
-	// Set state to paused when ALL clients have been paused
-	// so we can begin listening to global notifications
-	go func() {
-		wgPaused.Wait()
-		p.ChangeState(Paused)
-	}()
-
-	interrupt := make(chan struct{})
-
-	// Interrupt handler for global pause
-	go func() {
-		for {
-			state := <-p.StateInformer
-			if state == Paused {
-				LogInfo("Someone paused, interrupting sync")
-				p.ChangeState(Paused)
-				interrupt <- struct{}{}
-				return
-			}
-		}
-	}()
-
-	// Interrupt handler for when all players resumed
-	go func() {
-		wgDone.Wait()
-		p.ChangeState(Playing)
-		LogInfo("Syncing completed")
-		interrupt <- struct{}{}
-	}()
-
-	// Wait until global pause or all clients resumed
-	<-interrupt
+	// Wait until all clients are done syncing
+	wgDone.Wait()
+	LogInfo("Syncing completed")
 }
 
 // pauseClient pauses a client for duration amount of time.
-func (c *Client) pauseClient(duration time.Duration, wgDone *sync.WaitGroup,
-	wgPaused *sync.WaitGroup) {
+func (c *Client) pauseClient(duration time.Duration, wgDone *sync.WaitGroup) {
 	defer wgDone.Done()
 
 	// Pause
+	c.ignoreStateNotification(false) // Ignore the pause notification
 	LogInfof("Pausing %s for %s\n", c.Description(), duration.String())
-	c.PlayAwait(false, wgPaused)
-	LogInfo("Done pausing hehe")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go c.RequestWorker(c.playPayload(false), &wg)
+	wg.Wait()
 
-	// If the player is paused, break out to avoid unpausing
-	// else just wait until duration is over to unpause.
-	timeUp := time.After(duration)
-
-continueWait:
+	// Wait until the pause duration has passed
+	// or until the global state has been changed
 	select {
-	case state := <-c.Pool.StateInformer:
-		LogInfo("got a state", state, c.Description())
-		if state == Paused {
-			LogInfo("Someone paused, interrupting sync")
-			return
-		}
-		break continueWait
-	case <-timeUp:
+	case <-time.After(duration):
 		break
+	case <-c.Pool.StateInformer:
+		return
 	}
 
-	// Play (change state temporarily to ignore notification)
-	saveState := c.Pool.State()
-	c.Pool.ChangeState(Busy)
-	c.PlayBlock(true)
-	c.Pool.ChangeState(saveState)
+	// Play
+	c.ignoreStateNotification(true) // Ignore the play notification
+	wg.Add(1)
+	go c.RequestWorker(c.playPayload(true), &wg)
+	wg.Wait()
 	LogInfof("Unpausing %s\n", c.Description())
 }
