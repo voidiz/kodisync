@@ -2,17 +2,52 @@ name: Go
 
 on:
   push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+    tags:
+      - 'v*'
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
+  release:
+    name: Create new release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      
+    steps:
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+  build_and_publish:
+    name: Build and release on ${{ matrix.os }}
+    needs: [release]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+
+        include:
+          - os: windows-latest
+            asset_name: kodisync-windows.exe
+            asset_path: ./kodisync.exe
+          
+          - os: ubuntu-latest
+            asset_name: kodisync-ubuntu
+            asset_path: ./kodisync
+          
+          - os: macos-latest
+            asset_name: kodisync-macOS
+            asset_path: ./kodisync
         
     steps:
     - uses: actions/checkout@v2
@@ -24,3 +59,14 @@ jobs:
 
     - name: Build
       run: go build -v ./...
+      
+    - name: Upload build
+      id: upload-build
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.release.outputs.upload_url }}
+        asset_path: ${{ matrix.asset_path }}
+        asset_name: ${{ matrix.asset_name }}
+        asset_content_type: application/octet-stream
