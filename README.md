@@ -1,5 +1,10 @@
-# kodisync
-A program used to synchronize the playback of Kodi media players through the built-in webserver using the JSON-RPC protocol.
+<p align="center">
+  <img src="./assets/kodisync.svg" width="200" alt="kodisync">
+</p>
+<h2 align="center">kodisync</h2>
+<p align="center">
+  A program used to synchronize the playback of Kodi media players through the built-in webserver.
+</p>
 
 ## Features
 - Synchronizing desynchronized players (i.e. players that are ahead or behind other players)
